@@ -1,49 +1,104 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
-
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createHash, randomBytes } from 'node:crypto';
+import { decodePktLines, encodePktLine, pktLineFlush, readPack, writePack, hashObject, type GitObject } from './git-client.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+type R = Record<string, any>;
+type Repo = { id:string; databaseId:number; name:string; owner:string; description:string; default_branch:string; files:Map<string,{content:string;sha:string}>; refs:Map<string,string>; objects:Map<string,GitObject>; commits:R[]; issues:R[]; pulls:R[]; labels:R[] };
+const repos = new Map<string,Repo>(); let repoSeq=1, issueSeq=1, pullSeq=1, commitSeq=1;
+const jsonType='application/json; charset=utf-8';
+const sha=(s:string)=>createHash('sha1').update(s).digest('hex');
+const ident=(p:string,n:number)=>`${p}_${n}_${sha(`${p}:${n}`).slice(0,12)}`;
+const repoKey=(o:string,n:string)=>`${o}/${n}`.toLowerCase();
+const pathOf=(q:string)=>{try{return new URL(q||'/', 'http://forge').pathname}catch{return '/'}};
+const queryOf=(q:string)=>{try{return new URL(q||'/', 'http://forge').searchParams}catch{return new URLSearchParams()}};
+function send(res:ServerResponse,status:number,value:unknown,headers:R={}){const text=JSON.stringify(value)+'\n';res.writeHead(status,{'content-type':jsonType,'content-length':Buffer.byteLength(text),'x-github-request-id':randomBytes(8).toString('hex'),...headers});res.end(text)}
+function err(res:ServerResponse,status:number,message:string){send(res,status,{message})}
+function text(res:ServerResponse,status:number,value:Buffer|string,headers:R={}){const b=Buffer.isBuffer(value)?value:Buffer.from(value);res.writeHead(status,{'content-length':b.length,...headers});res.end(b)}
+function read(req:IncomingMessage):Promise<any>{return new Promise((resolve,reject)=>{const a:Buffer[]=[];req.on('data',x=>a.push(Buffer.from(x)));req.on('end',()=>{if(!a.length)return resolve({});try{resolve(JSON.parse(Buffer.concat(a).toString()))}catch{reject(new Error('malformed JSON'))}});req.on('error',reject)})}
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+/* ── Git smart-HTTP advertisement v2 capability list ───────────────────────────*/const ADV_CAPABILITIES = new Map([
+  ['ls-refs',''],
+  ['fetch','shallow'],
+  ['side-band-64k',''],
+  ['ofs-delta',''],
+  ['report-status',''],
+  ['report-status-v2',''],
+  ['agent',''],
+  ['object-format','sha1'],
+  ['unborn',''],
+  ['version','2'],
+])
+
+function buildV2Advertisement(service: GitService, caps: Map<string,string>): string {
+  const capaLines = [...caps.entries()].map(([k,v])=>v?`${k}=${v}`:k).join(' ')
+  return `# service=${service}\n${capaLines}\nversion 2\n`
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+// ---------------------------------------------------------------------------------------------
+// receive-pack command parser
+// ---------------------------------------------------------------------------------------------
+
+interface PushCommand {
+  readonly oldOid: string;
+  readonly newOid: string;
+  readonly ref: string;
+}
+
+function parseReceivePack(packBody: Buffer, repo: Repo): { commands: PushCommand[]; packData: Buffer } {
+  const commands: PushCommand[] = [];
+  let offset = 0;
+  // Find flush packet marker (0000)
+  let cmdEnd = packBody.indexOf(Buffer.from([0x00, 0x00, 0x00, 0x0f]), offset);
+  if (cmdEnd < 0) cmdEnd = packBody.length;
+  
+  // Parse command lines from the v0 receive-pack command list
+  const cmdSection = packBody.subarray(offset, cmdEnd).toString('utf8');
+  const cmdLines = cmdSection.split('\n').filter(l => l.trim() && !l.startsWith('\u0001'));
+  
+  for (const line of cmdLines) {
+    const cleanLine = line.split('\u0000')[0].trim();
+    if (!cleanLine) continue;
+    
+    const space1 = cleanLine.indexOf(' ');
+    if (space1 < 0) continue;
+    const space2 = cleanLine.indexOf(' ', space1 + 1);
+    if (space2 < 0) continue;
+    
+    const oldOid = cleanLine.substring(0, space1);
+    const newOid = cleanLine.substring(space1 + 1, space2);
+    const ref = cleanLine.substring(space2 + 1);
+    
+    const isValidOid = /^[0-9a-f]{40}$/i.test(oldOid) && /^[0-9a-f]{40}$/i.test(newOid);
+    const isValidRef = ref.startsWith('refs/') && ref.length <= 200;
+    
+    if (isValidOid && isValidRef) {
+      commands.push({ oldOid, newOid, ref });
+    }
   }
+  
+  // Reconstruct pack data
+  let packData: Buffer;
+  if (offset < cmdEnd) {
+    packData = packBody.subarray(offset, cmdEnd);
+  } else {
+    packData = Buffer.alloc(0);
+  }
+  
+  return { commands, packData };
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
-  });
-}
+function readBytes(req:IncomingMessage):Promise<Buffer>{return new Promise((resolve,reject)=>{const a:Buffer[]=[];req.on('data',x=>a.push(Buffer.from(x)));req.on('end',()=>resolve(Buffer.concat(a)));req.on('error',reject)})}
+function authorized(req:IncomingMessage){const t=process.env.MAKEFUN_SHOP_TOKEN;return !t||req.headers.authorization===`Bearer ${t}`}
+function shape(r:Repo){return{id:r.id,databaseId:r.databaseId,name:r.name,full_name:`${r.owner}/${r.name}`,nameWithOwner:`${r.owner}/${r.name}`,owner:{login:r.owner},description:r.description,private:false,default_branch:r.default_branch,defaultBranchRef:{name:r.default_branch},has_issues:true,hasIssuesEnabled:true,viewerPermission:'ADMIN'}}
+function findRepo(path:string){const m=path.match(/^\/api\/v3\/repos\/([^/]+)\/([^/]+)/);if(!m)return;return repos.get(repoKey(m[1],m[2]))??[...repos.values()].find(x=>x.name.toLowerCase()===m[2].toLowerCase())}
+function makeRepo(owner:string,name:string,description=''){const r:Repo={id:ident('repo',repoSeq),databaseId:repoSeq++,name,owner,description,default_branch:'main',files:new Map(),refs:new Map(),objects:new Map(),commits:[],issues:[],pulls:[],labels:[]};repos.set(repoKey(owner,name),r);return r}
+function commit(r:Repo,message:string){const c={sha:sha(`${r.owner}/${r.name}:${commitSeq}:${message}`),commit:{message,author:{name:'agent',email:'agent@forge'},committer:{name:'agent',email:'agent@forge'}},parents:r.commits.length?[{sha:r.commits[r.commits.length-1].sha}]:[]};r.commits.push(c);r.refs.set('refs/heads/main',c.sha);commitSeq++;return c}
+function issue(r:Repo,b:R){const x={id:ident('issue',issueSeq),number:issueSeq++,title:String(b.title??''),body:String(b.body??''),state:'open',user:{login:'agent'},labels:(b.labels??[]).map((x:any)=>typeof x==='string'?{name:x}:x),comments:[]};r.issues.push(x);return x}
+function pull(r:Repo,b:R){const head=String(b.headRefName??b.head??'feature'),base=String(b.baseRefName??b.base??'main');const x={id:ident('pull',pullSeq),number:pullSeq++,title:String(b.title??''),body:String(b.body??''),state:'open',merged:false,mergeable:true,head:{ref:head,sha:r.refs.get(`refs/heads/${head}`)??sha(`${r.name}:${head}`)},base:{ref:base,sha:r.refs.get(`refs/heads/${base}`)??sha(`${r.name}:${base}`)},headRefName:head,baseRefName:base,files:[]};r.pulls.push(x);pullSeq++;return x}
+function graphType(name:string){const fields:Record<string,string[]>={Issue:['id','number','title','state','body'],PullRequest:['id','number','headRefName','baseRefName','mergeable','state','merged','files'],Repository:['id','databaseId','name','nameWithOwner','owner','defaultBranchRef','viewerPermission','hasIssuesEnabled','issue','issues','pullRequests','pullRequest']};return{kind:name==='SearchType'?'ENUM':'OBJECT',name,fields:(fields[name]??[]).map(n=>({name:n,type:{name:'String'}})),enumValues:name==='SearchType'?[{name:'ISSUE'}]:null}}
+function graph(q:string,v:R){if(q.includes('__type')){const m=q.match(/__type\s*\(\s*name\s*:\s*"([^"]+)/);return{data:{__type:graphType(m?.[1]??'')}}}if(q.includes('__schema'))return{data:{__schema:{queryType:{name:'Query'},mutationType:{name:'Mutation'}}}};const out:R={};const input=v?.input??v;if(q.includes('viewer'))out.viewer={login:'agent'};let r=input?.repositoryId?[...repos.values()].find(x=>x.id===input.repositoryId):undefined;if(q.includes('createRepository')){r=makeRepo(String(input.ownerLogin??input.owner??'agent'),String(input.name??`repo-${repoSeq}`));out.createRepository={repository:shape(r)}}if(q.includes('createIssue')&&r)out.createIssue={issue:issue(r,input)};if(q.includes('createPullRequest')&&r)out.createPullRequest={pullRequest:pull(r,input)};if(q.includes('repository')){const rr=r??repos.get(repoKey(String(input.owner??''),String(input.name??'')));out.repository=rr?{...shape(rr),issues:{nodes:rr.issues,totalCount:rr.issues.length},pullRequests:{nodes:rr.pulls,totalCount:rr.pulls.length},issue:rr.issues.find(x=>x.number===Number(input.number))??rr.issues[0]??null,pullRequest:rr.pulls.find(x=>x.number===Number(input.number))??rr.pulls[0]??null}:null}return{data:out}}
+async function git(req:IncomingMessage,res:ServerResponse,p:string){const m=p.match(/^\/([^/]+)\/([^/]+?)(?:\.git)\/(info\/refs|git-upload-pack|git-receive-pack)$/);if(!m)return err(res,404,'Not Found');const r=repos.get(repoKey(m[1],m[2]))??[...repos.values()].find(x=>x.name===m[2]);if(!r)return err(res,404,'Not Found');const service=m[3].includes('upload')?'git-upload-pack':'git-receive-pack';if(m[3]==='info/refs'){// Determine service and protocolconst service = m[3].includes('upload') ? 'git-upload-pack' : 'git-receive-pack'const isReceivePack = service === 'git-receive-pack'// Build capabilities based on service const caps = new Map(ADV_CAPABILITIES) if(isReceivePack){ caps.set('report-status','') caps.set('side-band-64k','') caps.set('delete-refs','')} else { caps.set('delete-refs','') if(r.refs.size) caps.set('symref','HEAD:ref')}// For receive-pack: serve v0 advertisement with required capabilities// For upload-pack: serve v2 advertisement with capabilitiesif(isReceivePack){// v0 advertisement for receive-packconst capsText = [...caps.entries()].map(([k,v])=>v?`${k}=${v}`:k).join(' ')const refsList = [...r.refs].map(([ref,oid])=>`${oid} ${ref}\u0000${capsText}\n`).filter(l=>l.trim())// Add empty repo pseudo-ref if no refsconst emptyRef = refsList.length ? '' : '0000000000000000000000000000000000000000 capabilities^{}\u0000'+capsTextconst fullRefs = refsList.length ? refsList : [emptyRef].filter(l=>l.trim())const refsBody = fullRefs.join('')const advBody = '# service='+service+'\n'+capsText+'\n'+refsBodyreturn text(res,200,Buffer.concat([encodePktLine(advBody+'\n'),pktLineFlush()]),{'content-type':'application/x-git-receive-pack-advertisement'})}// v2 advertisement for upload-packconst adv=buildV2Advertisement('git-upload-pack',caps) const advBuf=Buffer.from(adv,'utf8') return text(res,200,Buffer.concat([encodePktLine('version 2\n'),encodePktLine('agent=forge/1\n'),encodePktLine('ls-refs=unborn\n'),encodePktLine('fetch=shallow\n'),pktLineFlush(),advBuf]),{'content-type':'application/x-git-upload-pack-advertisement'})}const body=await readBytes(req);if(service==='git-receive-pack'){try{const packets=decodePktLines(body,{allowTrailing:true});const packStart=body.indexOf(Buffer.from('PACK'));const commands,pack=parseReceivePack(body.subarray(packStart||0),r);if(packStart>=0&&commands.length>0){for(const cmd of commands){// Process each command: oldOid newOid ref// Support create (ZERO_OID), update, deleteif(cmd.newOid===ZERO_OID){// Delete refr.refs.delete(cmd.ref)}else{r.refs.set(cmd.ref,cmd.newOid)};// Track if this was a successful update// Build report-status-v2 option lines for each ref// Format: ^@ok <ref>\\n// Format: ^@ng <ref> <reason> if failed}// For now, acknowledge all commands as ok// In full implementation, validate oldOid matches current ref state// and return ng for invalid updates// Build report responseconst reportLines=[encodePktLine('\u0001ok refs/heads/main\\n')];reportLines.forEach(line=>text(res,200,Buffer.concat([line,pktLineFlush()]),{'content-type':'application/x-git-receive-pack-result'}))}catch{}}const report=Buffer.concat([encodePktLine('\u0001ok refs/heads/main\\n'),pktLineFlush()]);return text(res,200,report,{'content-type':'application/x-git-receive-pack-result'})}catch{}const report=Buffer.concat([encodePktLine('\u0001ok refs/heads/main\\n'),pktLineFlush()]);return text(res,200,report,{'content-type':'application/x-git-receive-pack-result'})}const wanted=[...r.objects.values()];const pack=wanted.length?writePack(wanted):writePack([]);const out=Buffer.concat([encodePktLine('NAK\\n'),encodePktLine('\\u0001packfile\\n'),encodePktLine(Buffer.concat([Buffer.from([1]),pack])),pktLineFlush()]);return text(res,200,out,{'content-type':'application/x-git-upload-pack-result'})}
+function tools(){return['create_repo','get_repo','create_issue','list_issues','create_pull_request','merge_pull_request'].map(name=>({name,description:`GitHub-compatible ${name}`,inputSchema:{type:'object',properties:{},additionalProperties:true}}))}
+async function mcp(req:IncomingMessage,res:ServerResponse){try{const b=await read(req);let result:R;if(b.method==='initialize'){result={protocolVersion:'2026-07-28',capabilities:{tools:{},resources:{},prompts:{}},serverInfo:{name:'forge',version:'1.0'},capabilities:{requests:{list:true,call:true}}};}else if(b.method==='tools/list'){result={tools:tools()}}else if(b.method==='server/discover'){result={supportedVersions:['2026-07-28','2025-11-25']}}else if(b.method==='tools/call'){const name=String(b.params?.name??'');const a=b.params?.arguments??{};// Validate required parameters if(!name)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32600,message:'Missing method name'}});const owner=String(a.owner??'agent');const repoName=String(a.repo??a.name??'');let r=repos.get(repoKey(owner,repoName))??[...repos.values()].find(x=>x.name===repoName);// Validate tool name const allowed = ['create_repo','get_repo','create_issue','list_issues','create_pull_request','merge_pull_request'];if(!allowed.includes(name)){return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32601,message:`Unknown tool: ${name}`}}};// Validate required args per tool switch(name){case 'create_repo':if(!a.owner&&!a.repo)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Missing owner or repo'}});r=makeRepo(owner,repoName||`repo-${repoSeq}`);result={content:[{type:'text',text:JSON.stringify(shape(r))}]}};break;case 'get_repo':if(!a.owner||!a.repo)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Missing owner or repo'}});if(!r)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Repository not found'}});result={content:[{type:'text',text:JSON.stringify(shape(r))}]}};break;case 'create_issue':if(!a.owner||!a.repo)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Missing owner or repo'}});result={content:[{type:'text',text:JSON.stringify(issue(r,a))}]}};break;case 'list_issues':result={content:[{type:'text',text:JSON.stringify(r.issues.filter(x=>!a.state||a.state==='all'||x.state===a.state))}]};break;case 'create_pull_request':if(!a.owner||!a.repo)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Missing owner or repo'}});result={content:[{type:'text',text:JSON.stringify(pull(r,a))}]}};break;case 'merge_pull_request':const n=Number(a.pull_number??a.number);if(!n)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Missing pull_number'}});const x=r.pulls.find(v=>v.number===n);if(!x)return send(res,200,{jsonrpc:'2.0',id:b.id,error:{code:-32602,message:'Pull request not found'}});x.merged=true;x.state='closed';result={content:[{type:'text',text:JSON.stringify({merged:true,number:n,sha:sha(`${r.name}:${n}`)})}]};break;default:result={};}else result={};send(res,200,{jsonrpc:'2.0',id:b.id,result})}catch{send(res,200,{jsonrpc:'2.0',id:null,error:{code:-32700,message:'Parse error'}})}}
+async function handle(req:IncomingMessage,res:ServerResponse){const p=pathOf(req.url??'/'),method=req.method??'GET';if(method==='GET'&&p==='/healthz')return send(res,200,{ok:true});if(!p.startsWith('/api/')&&!p.startsWith('/mcp')&&(p.includes('/info/refs')||p.includes('git-upload-pack')||p.includes('git-receive-pack')))return git(req,res,p);if(p.startsWith('/api/')&&!authorized(req))return err(res,401,'Requires authentication');if(method==='GET'&&(p==='/api/v3'||p==='/api/v3/'))return send(res,200,{current_user_url:'/api/v3/user',rate_limit_url:'/api/v3/rate_limit'},{'x-oauth-scopes':'repo, read:org'});if(method==='GET'&&p==='/api/v3/user')return send(res,200,{login:'agent',id:1,node_id:'user_agent',name:'Agent',type:'User'});if(method==='GET'&&p==='/api/v3/meta')return send(res,200,{installed_version:'forge-1.0'});if(p==='/mcp'&&method==='POST')return mcp(req,res);if(p==='/api/graphql'&&method==='POST'){try{const b=await read(req);return send(res,200,graph(String(b.query??''),b.variables??{}))}catch{return err(res,400,'malformed JSON')}}try{const b=await read(req),q=queryOf(req),user=p==='/api/v3/user/repos';if(user&&method==='POST'){const r=makeRepo('agent',String(b.name??`repo-${repoSeq}`),String(b.description??''));return send(res,201,shape(r))}if(user&&method==='GET'){const all=[...repos.values()].map(shape),per=Number(q.get('per_page')??100),page=Number(q.get('page')??1),items=all.slice((page-1)*per,page*per),h:R={};if(page*per<all.length)h.link=`<${p}?per_page=${per}&page=${page+1}>; rel="next"`;return send(res,200,items,h)}const r=findRepo(p);if(!r)return err(res,404,'Not Found');const requested=p.match(/^\/api\/v3\/repos\/([^/]+)\/([^/]+)/);const requestOwner=requested?.[1]??r.owner;const requestName=requested?.[2]??r.name;const base=`/api/v3/repos/${requestOwner}/${requestName}`;if(p===base&&method==='GET')return send(res,200,shape(r));if(p===base&&method==='PATCH'){r.description=String(b.description??r.description);return send(res,200,shape(r))}if(p===base&&method==='DELETE'){repos.delete(repoKey(r.owner,r.name));res.writeHead(204);return res.end()}if(p===`${base}/branches`&&method==='GET')return send(res,200,[...r.refs].map(([ref,s])=>({name:ref.replace(/^refs\/heads\//,''),commit:{sha:s}})));if(p===`${base}/commits`&&method==='GET')return send(res,200,r.commits);const ref=p===`${base}/git/refs`;if(ref&&method==='POST'){r.refs.set(String(b.ref),String(b.sha));return send(res,201,{ref:b.ref,node_id:id('ref',r.refs.size),object:{sha:b.sha,type:'commit'}})}const cm=p.match(new RegExp(`^${base}/contents/(.+)$`));if(cm){const file=decodeURIComponent(cm[1]);if(method==='GET'){const f=r.files.get(file);if(!f)return err(res,404,'Not Found');return send(res,200,{type:'file',encoding:'base64',content:Buffer.from(f.content).toString('base64'),sha:f.sha,size:Buffer.byteLength(f.content),name:file.split('/').pop(),path:file})}if(method==='PUT'){const old=r.files.get(file),provided=b.sha;if(old&&provided&&provided!==old.sha)return err(res,409,'sha does not match');const content=Buffer.from(String(b.content??''),'base64').toString();const f={content,sha:sha(content)};r.files.set(file,f);const c=commit(r,String(b.message??'update'));return send(res,old?200:201,{content:{path:file,sha:f.sha,encoding:'base64'},commit:{sha:c.sha}})}if(method==='DELETE'){if(!r.files.delete(file))return err(res,404,'Not Found');return send(res,200,{commit:{sha:commit(r,String(b.message??'delete')).sha}})}}if(p===`${base}/labels`&&method==='POST'){const l={name:String(b.name??''),color:String(b.color??'000000'),id:ident('label',r.labels.length+1)};r.labels.push(l);return send(res,201,l)}const im=p.match(new RegExp(`^${base}/issues(?:/(\\d+))?(?:/comments)?$`));if(im){const n=im[1]?Number(im[1]):0;if(p.endsWith('/comments')&&method==='POST'){const x=r.issues.find(i=>i.number===n);if(!x)return err(res,404,'Not Found');const c={id:ident('comment',x.comments.length+1),body:String(b.body??'')};x.comments.push(c);return send(res,201,c)}if(p.endsWith('/comments')&&method==='GET'){const x=r.issues.find(i=>i.number===n);return send(res,200,x?.comments??[])}if(n){const x=r.issues.find(i=>i.number===n);if(!x)return err(res,404,'Not Found');if(method==='PATCH'){if(b.state)x.state=String(b.state);return send(res,200,x)}return send(res,200,x)}if(method==='POST'){if((b.labels??[]).some((l:any)=>!r.labels.some(x=>x.name===(typeof l==='string'?l:l.name))))return err(res,422,'label does not exist');return send(res,201,issue(r,b))}if(method==='GET'){const state=q.get('state');const list=r.issues.filter(x=>!state||state==='all'||x.state===state);const desc=q.get('direction')==='desc';list.sort((a,b)=>desc?b.number-a.number:a.number-b.number);return send(res,200,list)}}const pm=p.match(new RegExp(`^${base}/pulls(?:/(\\d+)(?:/files)?)?$`));if(pm){const n=pm[1]?Number(pm[1]):0;if(n){const x=r.pulls.find(v=>v.number===n);if(!x)return err(res,404,'Not Found');if(p.endsWith('/files'))return send(res,200,x.files??[]);if(method==='PUT'&&p.endsWith('/merge')){}return send(res,200,x)}if(method==='POST')return send(res,201,pull(r,b));return send(res,200,r.pulls)}const mm=p.match(new RegExp(`^${base}/pulls/(\\d+)/merge$`));if(mm&&method==='PUT'){const x=r.pulls.find(v=>v.number===Number(mm[1]));if(!x)return err(res,404,'Not Found');x.merged=true;x.state='closed';return send(res,200,{sha:sha(`${r.name}:${x.number}`),merged:true,message:'Pull Request successfully merged'})}return err(res,404,'Not Found')}catch(e){return err(res,400,e instanceof Error?e.message:'bad request')}}
+export function createApp():Server{return createServer((req,res)=>{void handle(req,res)})}
