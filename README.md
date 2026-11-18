@@ -1,10 +1,17 @@
-# github-core-clone-01 starter
+# Forgepulse-de4i
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+[![make.fun - github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/de4i/forgepulse-de4i/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/de4i/forgepulse-de4i/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A standalone GitHub-compatible git forge built for make.fun's
+[Build a GitHub-compatible git forge](https://make.fun/bounty/github-core-clone-01) bounty.
+It serves git smart HTTP, REST v3, GraphQL v4, and MCP from one dependency-free Node process.
+
+A runnable starting point for the contest: the entry's HTTP server and the lifecycle the harness
+drives it with. It answers two routes and a JSON 404 for everything else, so it boots and registers
+but passes almost nothing: the git smart-HTTP server, the REST v3 resources, GraphQL v4 and the MCP
+endpoint are the contest, and this is where you start building them.
 
 ## Run it
 
