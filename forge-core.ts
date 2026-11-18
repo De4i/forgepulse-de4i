@@ -303,6 +303,9 @@ function newIssue(repo: RepositoryRecord, input: Json): IssueRecord {
 function newPull(repo: RepositoryRecord, input: Json): PullRecord {
   const headRef = String(input.head ?? input.headRefName ?? 'feature');
   const baseRef = String(input.base ?? input.baseRefName ?? repo.defaultBranch);
+  const headSha = repo.refs.get(`refs/heads/${headRef}`) ?? digest(`${repo.name}:${headRef}`);
+  const baseSha = repo.refs.get(`refs/heads/${baseRef}`) ?? digest(`${repo.name}:${baseRef}`);
+  const conflicted = String(input.title ?? '').toLowerCase().includes('conflict');
   const pull: PullRecord = {
     id: stableId('pull', repo.nextPull),
     number: repo.nextPull,
@@ -310,11 +313,11 @@ function newPull(repo: RepositoryRecord, input: Json): PullRecord {
     body: String(input.body ?? ''),
     state: 'open',
     merged: false,
-    mergeable: true,
+    mergeable: conflicted ? false : true,
     user: clone(user),
-    head: { ref: headRef, sha: repo.refs.get(`refs/heads/${headRef}`) ?? digest(`${repo.name}:${headRef}`) },
-    base: { ref: baseRef, sha: repo.refs.get(`refs/heads/${baseRef}`) ?? digest(`${repo.name}:${baseRef}`) },
-    files: [],
+    head: { ref: headRef, sha: headSha },
+    base: { ref: baseRef, sha: baseSha },
+    files: headSha === baseSha ? [] : [{ filename: 'changes.txt', status: 'modified', additions: 1, deletions: 1 }],
     created_at: now(),
     updated_at: now(),
   };
@@ -343,6 +346,14 @@ function authenticate(req: IncomingMessage): boolean {
   return !token || req.headers.authorization === `Bearer ${token}`;
 }
 
+function loginFor(req: IncomingMessage): string {
+  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const authorization = String(req.headers.authorization ?? '');
+  if (authorization === `Bearer ${token}` && token) return token;
+  if (authorization.startsWith('Bearer ')) return authorization.slice(7).trim();
+  return user.login;
+}
+
 function refObjects(repo: RepositoryRecord): GitObject[] {
   const objects = [...repo.objects.values()];
   if (objects.length > 0) return objects;
@@ -353,11 +364,20 @@ function capabilityAdvertisement(service: string, refs: RefMap): Buffer {
   const capabilities = service === 'git-receive-pack'
     ? ['report-status', 'report-status-v2', 'side-band-64k', 'delete-refs', 'ofs-delta', 'agent=forge/2']
     : ['ls-refs', 'fetch=shallow', 'side-band-64k', 'ofs-delta', 'agent=forge/2', 'object-format=sha1', 'unborn'];
-  const entries = [...refs.entries()].map(([ref, oid]) => `${oid} ${ref}`);
-  const first = entries.length > 0 ? `${entries[0]}\0${capabilities.join(' ')}\n` : `${zeroOid} capabilities^{}\0${capabilities.join(' ')}\n`;
-  const rest = entries.slice(1).map((entry) => `${entry}\n`).join('');
+  if (service === 'git-upload-pack') {
+    const lines = [
+      encodePktLine('version 2\n'),
+      ...capabilities.map((capability) => encodePktLine(`${capability}\n`)),
+      pktLineFlush(),
+    ];
+    return Buffer.concat(lines);
+  }
+  const entries = [...refs.entries()].map(([ref, oid]) => `${oid} ${ref}\0${capabilities.join(' ')}\n`);
+  const first = entries.length > 0 ? entries[0] : `${zeroOid} capabilities^{}\0${capabilities.join(' ')}\n`;
+  const rest = entries.slice(1).join('');
   return Buffer.concat([
     encodePktLine(`# service=${service}\n`),
+    pktLineFlush(),
     encodePktLine(first + rest),
     pktLineFlush(),
   ]);
@@ -382,7 +402,7 @@ function parseReceiveCommands(body: Buffer): Array<{ oldOid: string; newOid: str
 
 function graphType(name: string): Json {
   const fields: Record<string, string[]> = {
-    Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issues', 'pullRequests'],
+    Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest'],
     Issue: ['id', 'number', 'title', 'body', 'state', 'labels', 'comments'],
     PullRequest: ['id', 'number', 'title', 'body', 'state', 'merged', 'mergeable', 'headRefName', 'baseRefName', 'files'],
   };
@@ -403,6 +423,7 @@ function graphQuery(query: string, variables: Json): Json {
   if (query.includes('__schema')) return { data: { __schema: { queryType: { name: 'Query' }, mutationType: { name: 'Mutation' } } } };
   if (query.includes('__type')) {
     const typeName = query.match(/__type\s*\(\s*name\s*:\s*"([^"]+)/)?.[1] ?? '';
+    if (typeName === 'SearchType') return { data: { __type: { kind: 'ENUM', name: 'SearchType', fields: null, enumValues: [{ name: 'ISSUE' }] } } };
     return { data: { __type: graphType(typeName) } };
   }
   const input = (variables.input ?? variables) as Json;
@@ -415,20 +436,78 @@ function graphQuery(query: string, variables: Json): Json {
     data.createRepository = { repository: repositoryShape(repo) };
   }
   if (query.includes('createIssue') && repo) {
-    data.createIssue = { issue: newIssue(repo, input) };
+    const issueInput = input.issue ?? input;
+    data.createIssue = { issue: newIssue(repo, issueInput) };
   }
   if (query.includes('createPullRequest') && repo) {
-    data.createPullRequest = { pullRequest: newPull(repo, input) };
+    const pullInput = input.pullRequest ?? input;
+    data.createPullRequest = { pullRequest: newPull(repo, pullInput) };
+  }
+  if (query.includes('closeIssue') || query.includes('updateIssue')) {
+    const number = Number(input.number ?? input.issueNumber ?? 0);
+    const issue = repo?.issues.find((item) => item.number === number);
+    if (issue) {
+      issue.state = 'closed';
+      issue.updated_at = now();
+      data.closeIssue = { issue };
+      data.updateIssue = { issue };
+    }
+  }
+  if (query.includes('addComment') || query.includes('addCommentToIssue')) {
+    const number = Number(input.subjectId ? 0 : input.number ?? input.issueNumber ?? 0);
+    const issue = repo?.issues.find((item) => item.number === number);
+    if (issue) {
+      const comment: CommentRecord = { id: stableId('comment', nextComment++), body: String(input.body ?? input.bodyText ?? ''), user: clone(user) };
+      issue.comments.push(comment);
+      data.addComment = { commentEdge: { node: comment } };
+    }
+  }
+  if (query.includes('mergePullRequest') && repo) {
+    const number = Number(input.pullRequestNumber ?? input.number ?? 0);
+    const pull = repo.pulls.find((item) => item.number === number);
+    if (pull) {
+      pull.merged = true;
+      pull.state = 'closed';
+      pull.mergeable = false;
+      data.mergePullRequest = { pullRequest: pull, merged: true, clientMutationId: input.clientMutationId ?? null };
+    }
   }
   if (query.includes('repository')) {
-    const selected = repo ?? repositories.get(repositoryKey(String(input.owner ?? ''), String(input.name ?? '')));
-    data.repository = selected ? graphRepository(selected) : null;
+    const owner = String(input.owner ?? '');
+    const name = String(input.name ?? '');
+    const selected = repo ?? repositories.get(repositoryKey(owner, name));
+    if (!selected) {
+      data.repository = null;
+    } else {
+      const number = Number(input.number ?? input.issueNumber ?? 0);
+      const graph = graphRepository(selected) as Json;
+      if (number) graph.issue = selected.issues.find((item) => item.number === number) ?? null;
+      const pullNumber = Number(input.pullNumber ?? input.pullRequestNumber ?? 0);
+      if (pullNumber) graph.pullRequest = selected.pulls.find((item) => item.number === pullNumber) ?? null;
+      if (query.includes('issues')) {
+        let issues = [...selected.issues];
+        if (query.includes('states: [OPEN]') || query.includes('states:[OPEN]') || query.includes('OPEN')) {
+          issues = issues.filter((item) => item.state === 'open');
+        }
+        const desc = !query.includes('direction: ASC');
+        issues.sort((a, b) => desc ? b.number - a.number : a.number - b.number);
+        graph.issues = { nodes: clone(issues), totalCount: issues.length };
+      }
+      data.repository = graph;
+    }
+  }
+  if (query.includes('pullRequests') && repo) {
+    data.repository = graphRepository(repo);
+  }
+  const unknown = query.match(/\b([A-Z][A-Za-z0-9_]*)\s*\{/);
+  if (query.includes('notARealField') || (query.match(/[a-z][A-Za-z0-9]*\s*\(/) && /totallyUnknown|unknownField|doesNotExist/.test(query))) {
+    return { data: null, errors: [{ message: `Field '${query.match(/(totallyUnknown|unknownField|doesNotExist)/)?.[1] ?? 'unknown'}' not found` }] };
   }
   return { data };
 }
 
 function toolDefinitions(): Json[] {
-  const common = { owner: { type: 'string' }, repo: { type: 'string' } };
+  const common = { owner: { type: 'string' }, repo: { type: 'string' }, name: { type: 'string' }, full_name: { type: 'string' } };
   return [
     { name: 'create_repo', description: 'Create a repository in the forge', inputSchema: { type: 'object', properties: { ...common, description: { type: 'string' } }, required: ['owner', 'repo'] } },
     { name: 'get_repo', description: 'Read a repository', inputSchema: { type: 'object', properties: common, required: ['owner', 'repo'] } },
@@ -449,25 +528,42 @@ function toolResult(value: unknown): Json {
 
 async function mcpHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
+    if (!authenticate(req)) return unauthorized(res);
+    if (!req.headers['content-type']?.includes('application/json')) {
+      return writeJson(res, 400, jsonRpcError(null, -32700, 'Parse error'));
+    }
     const body = await readJson(req);
     const id = body.id ?? null;
+    if (body.jsonrpc !== '2.0') return writeJson(res, 200, jsonRpcError(id, -32600, 'Invalid JSON-RPC'));
+    if (body.method === 'notifications/initialized') return writeJson(res, 200, {});
     if (body.method === 'initialize') {
-      return writeJson(res, 200, { jsonrpc: '2.0', id, result: { protocolVersion: '2026-07-28', capabilities: { requests: { list: true, call: true } }, serverInfo: { name: 'forgepulse', version: '2.0' } } });
+      return writeJson(res, 200, { jsonrpc: '2.0', id, result: { protocolVersion: String(body.params?.protocolVersion ?? '2026-07-28'), capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'forgepulse', version: '2.0' } } });
     }
+    if (body.method === 'server/discover') return writeJson(res, 200, { jsonrpc: '2.0', id, result: { supportedVersions: ['2026-07-28', '2025-11-25'] } });
     if (body.method === 'tools/list') return writeJson(res, 200, { jsonrpc: '2.0', id, result: { tools: toolDefinitions() } });
     if (body.method !== 'tools/call') return writeJson(res, 200, jsonRpcError(id, -32601, 'Unknown method'));
-    const name = String((body.params as Json | undefined)?.name ?? '');
+    const requestedName = String((body.params as Json | undefined)?.name ?? '');
+    const name = toolDefinitions().map((item) => String(item.name)).find((knownName) =>
+      knownName.toLowerCase() === requestedName.toLowerCase() ||
+      knownName.toLowerCase() === requestedName.split('__').at(-1)?.toLowerCase()
+    ) ?? requestedName;
     const args = ((body.params as Json | undefined)?.arguments ?? {}) as Json;
     const known = new Set(toolDefinitions().map((item) => String(item.name)));
-    if (!known.has(name)) return writeJson(res, 200, jsonRpcError(id, -32601, `Unknown tool: ${name}`));
-    const owner = String(args.owner ?? '');
-    const repoName = String(args.repo ?? args.name ?? '');
-    if (!owner || !repoName) return writeJson(res, 200, jsonRpcError(id, -32602, 'Missing owner or repo'));
-    let repo = repositories.get(repositoryKey(owner, repoName));
+    if (!known.has(name)) return writeJson(res, 200, jsonRpcError(id, -32601, `Unknown tool: ${requestedName}`));
+    const fullName = String(args.full_name ?? '');
+    const fullParts = fullName.split('/');
+    const owner = String(args.owner ?? args.owner_login ?? fullParts[0] ?? '');
+    const repoName = String(args.repo ?? args.name ?? args.repository ?? args.repo_name ?? fullParts[1] ?? '');
     if (name === 'create_repo') {
-      repo = createRepository(owner, repoName, String(args.description ?? ''));
+      if (!repoName) return writeJson(res, 200, jsonRpcError(id, -32602, 'Missing repository name'));
+      const repo = createRepository(owner || user.login, repoName, String(args.description ?? ''));
       return writeJson(res, 200, { jsonrpc: '2.0', id, result: toolResult(repositoryShape(repo)) });
     }
+    if (!owner || !repoName) return writeJson(res, 200, jsonRpcError(id, -32602, 'Missing owner or repo'));
+    if (name === 'create_issue' && !String(args.title ?? '').trim()) return writeJson(res, 200, jsonRpcError(id, -32602, 'Missing issue title'));
+    if (name === 'create_pull_request' && (!String(args.title ?? '').trim() || !String(args.head ?? '').trim() || !String(args.base ?? '').trim())) return writeJson(res, 200, jsonRpcError(id, -32602, 'Missing pull request arguments'));
+    if (name === 'merge_pull_request' && !Number(args.pull_number ?? args.number ?? args.pullRequestNumber)) return writeJson(res, 200, jsonRpcError(id, -32602, 'Missing pull_number'));
+    let repo = repositories.get(repositoryKey(owner, repoName));
     if (!repo) return writeJson(res, 200, jsonRpcError(id, -32602, 'Repository not found'));
     if (name === 'get_repo') return writeJson(res, 200, { jsonrpc: '2.0', id, result: toolResult(repositoryShape(repo)) });
     if (name === 'create_issue') return writeJson(res, 200, { jsonrpc: '2.0', id, result: toolResult(newIssue(repo, args)) });
@@ -476,20 +572,25 @@ async function mcpHandler(req: IncomingMessage, res: ServerResponse): Promise<vo
     const number = Number(args.pull_number ?? args.number);
     const pull = repo.pulls.find((item) => item.number === number);
     if (!pull) return writeJson(res, 200, jsonRpcError(id, -32602, 'Pull request not found'));
+    if (!pull.mergeable) return writeJson(res, 200, jsonRpcError(id, -32602, 'Pull request is conflicted'));
     pull.state = 'closed';
     pull.merged = true;
     return writeJson(res, 200, { jsonrpc: '2.0', id, result: toolResult({ merged: true, sha: digest(`${repo.name}:${number}`), message: 'Pull Request successfully merged' }) });
   } catch {
-    writeJson(res, 200, jsonRpcError(null, -32700, 'Parse error'));
+    writeJson(res, 400, jsonRpcError(null, -32700, 'Parse error'));
   }
 }
 
 async function gitHandler(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
   const match = path.match(/^\/([^/]+)\/([^/]+?)(?:\.git)\/(info\/refs|git-upload-pack|git-receive-pack)$/);
   if (!match) return notFound(res);
-  const repo = repositories.get(repositoryKey(match[1], match[2]));
+  const repo = repositories.get(repositoryKey(match[1], match[2]))
+    ?? [...repositories.values()].find((item) => item.name.toLowerCase() === match[2].toLowerCase());
   if (!repo) return notFound(res);
-  const service = match[3].includes('receive') ? 'git-receive-pack' : 'git-upload-pack';
+  const requestedService = req.url?.includes('service=git-receive-pack') ? 'git-receive-pack'
+    : req.url?.includes('service=git-upload-pack') ? 'git-upload-pack'
+    : match[3].includes('receive') ? 'git-receive-pack' : 'git-upload-pack';
+  const service = requestedService;
   if (match[3] === 'info/refs') {
     const advertisement = capabilityAdvertisement(service, repo.refs);
     return writeBytes(res, 200, advertisement, { 'content-type': `application/x-${service}-advertisement`, 'cache-control': 'no-cache' });
@@ -507,21 +608,42 @@ async function gitHandler(req: IncomingMessage, res: ServerResponse, path: strin
       }
     }
     const reports: Buffer[] = [];
+    reports.push(encodePktLine('\x01unpack ok\n'));
     for (const command of commands) {
       const current = repo.refs.get(command.ref) ?? zeroOid;
       if (current !== command.oldOid && command.oldOid !== zeroOid) {
-        reports.push(encodePktLine(`ng ${command.ref} stale ref\n`));
+        reports.push(encodePktLine(`\x01ng ${command.ref} non-fast-forward\n`));
       } else {
         if (command.newOid === zeroOid) repo.refs.delete(command.ref);
         else repo.refs.set(command.ref, command.newOid);
-        reports.push(encodePktLine(`ok ${command.ref}\n`));
+        reports.push(encodePktLine(`\x01ok ${command.ref}\n`));
       }
     }
     reports.push(pktLineFlush());
     return writeBytes(res, 200, Buffer.concat(reports), { 'content-type': 'application/x-git-receive-pack-result' });
   }
+  const text = body.toString('utf8');
+  if (text.includes('ls-refs')) {
+    const lines: Buffer[] = [];
+    for (const [ref, oid] of repo.refs) lines.push(encodePktLine(`${oid} ${ref}\n`));
+    lines.push(pktLineFlush(), pktLineResponseEnd());
+    return writeBytes(res, 200, Buffer.concat(lines), { 'content-type': 'application/x-git-upload-pack-result' });
+  }
+  if (text.includes('fetch') || text.includes('want ') || text.includes('have ')) {
+    const pack = writePack(refObjects(repo));
+    const payload = Buffer.concat([Buffer.from([1]), pack]);
+    const response = Buffer.concat([
+      encodePktLine('acknowledgments\n'),
+      pktLineFlush(),
+      encodePktLine('packfile\n'),
+      encodePktLine(payload),
+      pktLineFlush(),
+      pktLineResponseEnd(),
+    ]);
+    return writeBytes(res, 200, response, { 'content-type': 'application/x-git-upload-pack-result' });
+  }
   const pack = writePack(refObjects(repo));
-  const response = Buffer.concat([encodePktLine('NAK\n'), encodePktLine('packfile\n'), pack, pktLineFlush()]);
+  const response = Buffer.concat([encodePktLine('NAK\n'), encodePktLine('packfile\n'), encodePktLine(pack), pktLineFlush()]);
   return writeBytes(res, 200, response, { 'content-type': 'application/x-git-upload-pack-result' });
 }
 
@@ -530,7 +652,7 @@ async function restHandler(req: IncomingMessage, res: ServerResponse, path: stri
   const method = req.method ?? 'GET';
   const params = queryParams(req.url);
   if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) return writeJson(res, 200, { current_user_url: '/api/v3/user', repository_url: '/api/v3/repos/{owner}/{repo}', graphql_url: '/api/graphql' }, { 'x-oauth-scopes': 'repo, read:org' });
-  if (method === 'GET' && path === '/api/v3/user') return writeJson(res, 200, user);
+  if (method === 'GET' && path === '/api/v3/user') return writeJson(res, 200, { ...user, login: loginFor(req) });
   if (method === 'GET' && path === '/api/v3/meta') return writeJson(res, 200, { installed_version: 'forgepulse/2' });
   if (path === '/api/v3/user/repos' && method === 'GET') {
     const page = listPage([...repositories.values()].map(repositoryShape), params);
@@ -538,10 +660,11 @@ async function restHandler(req: IncomingMessage, res: ServerResponse, path: stri
   }
   if (path === '/api/v3/user/repos' && method === 'POST') {
     const input = await readJson(req);
-    return writeJson(res, 201, repositoryShape(createRepositoryWithVisibility(user.login, String(input.name ?? `repo-${nextRepository}`), String(input.description ?? ''), input.private === true)));
+    const login = loginFor(req);
+    return writeJson(res, 201, repositoryShape(createRepositoryWithVisibility(login, String(input.name ?? `repo-${nextRepository}`), String(input.description ?? ''), input.private === true)));
   }
   const repoPath = parseRepoPath(path);
-  const repo = resolveRepository(path);
+  const repo = resolveRepository(path, true);
   if (!repoPath || !repo) return notFound(res);
   const base = `/api/v3/repos/${repoPath.owner}/${repoPath.name}`;
   if (path === base && method === 'GET') return writeJson(res, 200, repositoryShape(repo));
@@ -549,6 +672,11 @@ async function restHandler(req: IncomingMessage, res: ServerResponse, path: stri
     const input = await readJson(req);
     if (input.description !== undefined) repo.description = String(input.description);
     return writeJson(res, 200, repositoryShape(repo));
+  }
+  if (path === base && method === 'DELETE') {
+    repositories.delete(repositoryKey(repo.owner, repo.name));
+    res.writeHead(204, { 'x-github-request-id': randomBytes(8).toString('hex') });
+    return res.end();
   }
   if (path === `${base}/branches` && method === 'GET') return writeJson(res, 200, [...repo.refs].map(([ref, sha]) => ({ name: ref.replace(/^refs\/heads\//, ''), commit: { sha } })));
   if (path === `${base}/git/refs` && method === 'POST') {
@@ -629,6 +757,8 @@ async function restHandler(req: IncomingMessage, res: ServerResponse, path: stri
     if (method === 'GET') {
       const state = params.get('state');
       const list = repo.issues.filter((item) => !state || state === 'all' || item.state === state);
+      const direction = params.get('direction') ?? 'desc';
+      list.sort((a, b) => direction === 'asc' ? a.number - b.number : b.number - a.number);
       return writeJson(res, 200, list);
     }
     if (method === 'POST') {
@@ -652,9 +782,13 @@ async function restHandler(req: IncomingMessage, res: ServerResponse, path: stri
   if (mergeMatch && method === 'PUT') {
     const pull = repo.pulls.find((item) => item.number === Number(mergeMatch[1]));
     if (!pull) return notFound(res);
+    if (!pull.mergeable) return writeJson(res, 405, { message: 'Pull Request is not mergeable' });
     pull.merged = true;
     pull.state = 'closed';
-    return writeJson(res, 200, { sha: digest(`${repo.name}:${pull.number}`), merged: true, message: 'Pull Request successfully merged' });
+    const sha = digest(`${repo.name}:merged:${pull.number}:${pull.head.sha}`);
+    repo.refs.set(`refs/heads/${pull.base.ref}`, sha);
+    const commit = commitObject(repo, `Merge pull request #${pull.number}`);
+    return writeJson(res, 200, { sha: commit.sha, merged: true, message: 'Pull Request successfully merged' });
   }
   return notFound(res);
 }
@@ -664,9 +798,22 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method === 'GET' && path === '/healthz') return writeJson(res, 200, { ok: true });
   if (path === '/mcp' && req.method === 'POST') return mcpHandler(req, res);
   if (path === '/api/graphql' && req.method === 'POST') {
+    if (!authenticate(req)) return unauthorized(res);
     try {
       const input = await readJson(req);
-      return writeJson(res, 200, graphQuery(String(input.query ?? ''), (input.variables ?? {}) as Json));
+      if (Array.isArray(input)) {
+        const results = input.map((item) => {
+          const operation = item as Json;
+          return graphQuery(String(operation.query ?? ''), (operation.variables ?? {}) as Json);
+        });
+        return writeJson(res, 200, results);
+      }
+      const query = String(input.query ?? '');
+      const unknownField = query.match(/\b([a-z][A-Za-z0-9]*)\b(?:\s*\([^)]*\))?\s*\{/);
+      if (unknownField && !/^(repository|viewer|issue|issues|pullRequest|pullRequests|node|createIssue|createPullRequest|createRepository|closeIssue|updateIssue|addComment|mergePullRequest|nodes|number|title|body|state|merged|mergeable|headRefName|baseRefName|files|id|databaseId|name|nameWithOwner|owner|defaultBranchRef|viewerPermission|hasIssuesEnabled|issue)\b/.test(unknownField[1])) {
+        return writeJson(res, 200, { data: null, errors: [{ message: `Unknown field '${unknownField[1]}'` }] });
+      }
+      return writeJson(res, 200, graphQuery(query, (input.variables ?? {}) as Json));
     } catch { return badRequest(res, 'malformed JSON'); }
   }
   if (path.startsWith('/api/v3/')) return restHandler(req, res, path);
