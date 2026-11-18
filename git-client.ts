@@ -1521,8 +1521,9 @@ export class GitClient {
       for (const token of tokens.slice(1)) {
         if (token.startsWith('symref-target:')) symrefTarget = token.slice('symref-target:'.length);
         else if (token.startsWith('peeled:')) peeled = token.slice('peeled:'.length);
-      else if (token === 'peeled' && tokens.indexOf(token) < tokens.length - 1) {
-        peeled = tokens[tokens.indexOf(token) + 1];
+        else if (token === 'peeled' && tokens.indexOf(token) < tokens.length - 1) {
+          peeled = tokens[tokens.indexOf(token) + 1];
+        }
       }
       if (first === 'unborn') {
         refs.push({ oid: ZERO_OID, name, unborn: true, symrefTarget });
