@@ -158,7 +158,7 @@ function compatible(variable: TypeRef, expected: TypeRef, fallback: boolean): bo
 }
 
 type Context = { schema: Schema; document: Document; definitions: Map<string, Variable>; variables: ValueMap;
-  errors: Array<{ message: string; path?: Array<string | number> }>; visited: number };
+  errors: Array<{ message: string; path?: Array<string | number> }>; visited: number; completed: number };
 function argumentValue(ctx: Context, literal: Literal, type: TypeRef, path: string, fallback = false): any {
   if (literal.kind === 'variable') {
     const definition = ctx.definitions.get(literal.name);
@@ -284,8 +284,10 @@ function collect(ctx: Context, actual: string, selections: Selection[], result: 
 }
 
 class NullField extends Error {}
+class QueryBudget extends Error {}
 type Path = Array<string | number>;
 function complete(ctx: Context, type: TypeRef, value: unknown, selections: Selection[], path: Path): unknown {
+  if (++ctx.completed > 50_000) throw new QueryBudget('GraphQL result exceeds maximum execution cost.');
   try {
     if (value == null) {
       if (type.nonNull) throw new Error('Cannot return null for non-null field "' + path.join('.') + '".');
@@ -303,6 +305,7 @@ function complete(ctx: Context, type: TypeRef, value: unknown, selections: Selec
     }
     return value;
   } catch (error) {
+    if (error instanceof QueryBudget) throw error;
     if (!(error instanceof NullField)) ctx.errors.push({ message: message(error), path });
     if (type.nonNull) throw new NullField();
     return null;
@@ -338,7 +341,7 @@ export function execute(schema: Schema, query: string, supplied: ValueMap, name?
       : document.operations.length === 1 ? document.operations[0] : undefined;
     if (!operation) throw new Error(name ? 'Unknown operation "' + name + '".' : 'operationName is required.');
     if (operation.kind === 'subscription') throw new Error('Subscriptions are not supported on this endpoint.');
-    const ctx: Context = { schema, document, definitions: new Map(), variables: Object.create(null), errors: [], visited: 0 };
+    const ctx: Context = { schema, document, definitions: new Map(), variables: Object.create(null), errors: [], visited: 0, completed: 0 };
     for (const definition of operation.variables) {
       ctx.definitions.set(definition.name, definition);
       inputType(schema, definition.type);

@@ -1,6 +1,6 @@
 import { Fault, missing, optional, type Input, type Repository, type Store, type Pull } from './store.ts';
 
-export type Answer = { status: number; body?: unknown; headers?: Record<string, string> };
+export type Answer = { status: number; body?: unknown; encodedJSON?: Buffer; headers?: Record<string, string> };
 export type RestContext = { method: string; origin: string; path: string; parts: string[]; query: URLSearchParams;
   json: () => Promise<Input> };
 const ok = (body: unknown, status = 200): Answer => ({ status, body });
@@ -156,7 +156,7 @@ export async function rest(ctx: RestContext, store: Store): Promise<Answer> {
         break;
       }
       const issue = repo.issue(number(key));
-      if (route.length === 5 && verb === 'GET') return ok(issue);
+      if (route.length === 5 && verb === 'GET') return { status: 200, encodedJSON: repo.issueJSON(issue) };
       if (route.length === 5 && verb === 'PATCH') return ok(repo.updateIssue(issue, await json()));
       if (route.length === 6 && action === 'comments') {
         if (verb === 'GET') return paginated(repo.comments.get(issue.number) ?? [], ctx);

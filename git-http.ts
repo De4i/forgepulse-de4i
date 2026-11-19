@@ -13,7 +13,8 @@ const AGENT = 'agent=forgepulse/3';
 const uploadV2 = Buffer.concat(['version 2', AGENT, 'ls-refs=unborn', 'fetch=shallow wait-for-done',
   'object-format=sha1'].map(s => encodePktLine(s + '\n')).concat(FLUSH));
 const receiveCaps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', AGENT, 'object-format=sha1'];
-const uploadCaps = ['side-band-64k', 'shallow', 'no-progress', 'include-tag', 'ofs-delta', AGENT, 'object-format=sha1'];
+const uploadCaps = ['side-band-64k', 'shallow', 'deepen-relative', 'deepen-since', 'deepen-not', 'no-progress',
+  'include-tag', 'ofs-delta', AGENT, 'object-format=sha1'];
 const preambles = {
   [UPLOAD]: Buffer.concat([encodePktLine(`# service=${UPLOAD}\n`), FLUSH]),
   [RECEIVE]: Buffer.concat([encodePktLine(`# service=${RECEIVE}\n`), FLUSH]),
@@ -25,19 +26,24 @@ function sortedRefs(repo: Repository): Array<[string, string]> {
 
 export function advertisement(repo: Repository, service: GitService, v2: boolean): Buffer {
   if (service === UPLOAD && v2) return uploadV2;
+  const key = 'advertisement:' + service;
+  const cached = repo.packCache.get(key);
+  if (cached) return cached;
   const caps = service === RECEIVE ? receiveCaps : uploadCaps.concat(`symref=HEAD:${repo.headRef}`);
   const refs = sortedRefs(repo);
   if (service === UPLOAD && repo.tip) refs.unshift(['HEAD', repo.tip]);
   if (!refs.length) refs.push(['capabilities^{}', ZERO_OID]);
   const lines = refs.map(([ref, oid], index) =>
     encodePktLine(`${oid} ${ref}${index === 0 ? '\0' + caps.join(' ') : ''}\n`));
-  for (const [ref, oid] of refs) {
+  if (service === UPLOAD) for (const [ref, oid] of refs) {
     if (ref.startsWith('refs/tags/')) {
       const peeled = repo.peel(oid);
       if (peeled !== oid) lines.push(encodePktLine(`${peeled} ${ref}^{}\n`));
     }
   }
-  return Buffer.concat([preambles[service], ...lines, FLUSH]);
+  const response = Buffer.concat([preambles[service], ...lines, FLUSH]);
+  repo.cachePack(key, response);
+  return response;
 }
 
 function sideband(body: Buffer, band = 1): Buffer[] {
@@ -80,7 +86,7 @@ function parseUpdates(body: Buffer) {
 
 // The walk only expands objects introduced by this push. An existing object was already
 // checked when its ref was written, so a small push on deep history stays small.
-function incomingClosure(root: string, repo: Repository, incoming: Map<string, GitObject>): Set<string> {
+function incomingClosure(root: string, repo: Repository, incoming: Map<string, GitObject>, parents: Map<string, string[]>): Set<string> {
   const introduced = new Set<string>();
   const stack: Array<[string, GitObject['type']?]> = [[root]];
   while (stack.length) {
@@ -92,6 +98,7 @@ function incomingClosure(root: string, repo: Repository, incoming: Map<string, G
     introduced.add(oid);
     if (object.type === 'commit') {
       const commit = parseCommit(object.data);
+      parents.set(oid, commit.parents);
       stack.push([commit.tree, 'tree']);
       for (const parent of commit.parents) stack.push([parent, 'commit']);
     } else if (object.type === 'tree') {
@@ -107,6 +114,21 @@ function incomingClosure(root: string, repo: Repository, incoming: Map<string, G
   return introduced;
 }
 function directory(mode: string): boolean { return mode === '40000' || mode === '040000'; }
+
+function fastForward(repo: Repository, old: string, next: string, incomingParents: Map<string, string[]>): boolean {
+  const stack = [next];
+  const seen = new Set<string>();
+  while (stack.length) {
+    const oid = stack.pop()!;
+    if (oid === old) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    if (repo.objects.has(oid)) {
+      if (repo.ancestor(old, oid)) return true;
+    } else for (const parent of incomingParents.get(oid) ?? []) stack.push(parent);
+  }
+  return false;
+}
 
 export function receivePack(repo: Repository, body: Buffer): Buffer {
   const { commands, caps, pack } = parseUpdates(body);
@@ -137,12 +159,14 @@ export function receivePack(repo: Repository, body: Buffer): Buffer {
       const type = (repo.objects.get(next) ?? incoming.get(next))?.type;
       try {
         if (!type || (ref.startsWith('refs/heads/') && type !== 'commit')) throw new Error('invalid target');
-        const added = incomingClosure(next, repo, incoming);
-        for (const oid of added) repo.objects.set(oid, incoming.get(oid)!);
-        if (old !== ZERO_OID && old !== next && (ref.startsWith('refs/tags/') || !repo.ancestor(old, next)))
+        const parents = new Map<string, string[]>();
+        const added = incomingClosure(next, repo, incoming, parents);
+        if (old !== ZERO_OID && old !== next && (ref.startsWith('refs/tags/') || !fastForward(repo, old, next, parents)))
           error = 'non-fast-forward';
-        if (!error) repo.setRef(ref, next);
-        else for (const oid of added) repo.objects.delete(oid);
+        if (!error) {
+          for (const oid of added) repo.objects.set(oid, incoming.get(oid)!);
+          repo.setRef(ref, next);
+        }
       } catch {
         error = 'missing or invalid object';
       }
@@ -159,18 +183,25 @@ function lsRefs(repo: Repository, args: string[]): Buffer {
   const prefixes = args.filter(line => line.startsWith('ref-prefix ')).map(line => line.slice(11));
   const include = (ref: string) => !prefixes.length || prefixes.some(prefix => ref.startsWith(prefix));
   const peel = args.includes('peel');
-  const symref = args.includes('symrefs') ? ` symref-target:${repo.headRef}` : '';
+  const symrefs = args.includes('symrefs');
+  const unborn = args.includes('unborn');
+  const key = 'ls:' + JSON.stringify([peel, symrefs, unborn, prefixes]);
+  const cached = repo.packCache.get(key);
+  if (cached) return cached;
+  const symref = symrefs ? ` symref-target:${repo.headRef}` : '';
   const lines: Buffer[] = [];
   if (include('HEAD')) {
     if (repo.tip) lines.push(encodePktLine(`${repo.tip} HEAD${symref}\n`));
-    else if (args.includes('unborn')) lines.push(encodePktLine(`unborn HEAD${symref}\n`));
+    else if (unborn) lines.push(encodePktLine(`unborn HEAD${symref}\n`));
   }
   for (const [ref, oid] of sortedRefs(repo)) {
     if (!include(ref)) continue;
     const target = peel && ref.startsWith('refs/tags/') ? repo.peel(oid) : oid;
     lines.push(encodePktLine(`${oid} ${ref}${target !== oid ? ' peeled:' + target : ''}\n`));
   }
-  return Buffer.concat([...lines, FLUSH]);
+  const response = Buffer.concat([...lines, FLUSH]);
+  if (key.length < 1024) repo.cachePack(key, response);
+  return response;
 }
 
 type Fetch = { wants: string[]; haves: string[]; shallow: Set<string>; depth: number; since: number; omit: string[];
@@ -200,6 +231,7 @@ function parseFetch(lines: string[]): Fetch {
   }
   request.wants = [...new Set(request.wants)];
   request.haves = [...new Set(request.haves)];
+  request.relative ||= request.features.has('deepen-relative');
   return request;
 }
 
@@ -393,7 +425,7 @@ function fetchPack(repo: Repository, request: Fetch, v2: boolean): Buffer {
   if (band) lines.push(...sideband(pack), FLUSH);
   else lines.push(pack);
   const response = Buffer.concat(lines);
-  if (cacheKey) repo.cachePack(cacheKey, response);
+  if (cacheKey && cacheKey.length < 1024) repo.cachePack(cacheKey, response);
   return response;
 }
 

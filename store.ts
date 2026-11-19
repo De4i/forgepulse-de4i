@@ -81,7 +81,7 @@ export class Repository {
   readonly labels = new Map<string, Label>();
   readonly comments = new Map<number, Comment[]>();
   readonly nodes = new Set<string>();
-  readonly counts = { number: 0 };
+  private nextWorkItem = 1;
   readonly createdAt: string;
   updatedAt: string;
   description: string;
@@ -90,6 +90,7 @@ export class Repository {
   private readonly trees = new Map<string, TreeEntry[]>();
   private readonly tags = new Map<string, string>();
   private readonly snapshots = new Map<string, Snapshot>();
+  private readonly issueBodies = new WeakMap<Issue, Buffer>();
   private packCacheBytes = 0;
 
   constructor(store: Store, name: string, description: string, privateRepo: boolean) {
@@ -356,7 +357,7 @@ export class Repository {
       }
     }
     const id = this.store.allocate();
-    const issue: Issue = { id, node_id: this.store.globalId('Issue', id), number: ++this.counts.number,
+    const issue: Issue = { id, node_id: this.store.globalId('Issue', id), number: this.nextWorkItem++,
       title, body, labels, state: 'open', user: this.owner, comments: 0,
       created_at: this.store.now, updated_at: this.store.now, closed_at: null };
     this.issues.set(issue.number, issue);
@@ -366,6 +367,12 @@ export class Repository {
 
   issue(number: number): Issue { return this.issues.get(number) ?? missing(); }
   pull(number: number): Pull { return this.pulls.get(number) ?? missing(); }
+  issueJSON(issue: Issue): Buffer {
+    let body = this.issueBodies.get(issue);
+    if (!body) this.issueBodies.set(issue, body = Buffer.from(JSON.stringify(issue)));
+    return body;
+  }
+
   updateIssue(issue: Issue, input: Input): Issue {
     const title = input.title === undefined ? issue.title : required(input, 'title');
     const body = optional(input, 'body', issue.body);
@@ -376,6 +383,7 @@ export class Repository {
     issue.state = state;
     issue.closed_at = state === 'closed' ? issue.closed_at ?? this.store.now : null;
     issue.updated_at = this.store.now;
+    this.issueBodies.delete(issue);
     return issue;
   }
 
@@ -388,6 +396,7 @@ export class Repository {
     if (!list) this.comments.set(issue.number, list = []);
     list.push(comment);
     issue.comments = list.length;
+    this.issueBodies.delete(issue);
     this.store.register(comment.node_id, {type: 'IssueComment', value: comment, repo: this});
     return comment;
   }
@@ -404,7 +413,7 @@ export class Repository {
     const baseAtOpen = this.refs.get(branchRef(base));
     if (!headAtOpen || !baseAtOpen || head === base) throw new Fault(422, 'Invalid head or base branch');
     const id = this.store.allocate();
-    const pull: Pull = { id, node_id: this.store.globalId('PullRequest', id), number: ++this.counts.number,
+    const pull: Pull = { id, node_id: this.store.globalId('PullRequest', id), number: this.nextWorkItem++,
       title, body, user: this.owner, head, base, headAtOpen, baseAtOpen, state: 'open', merged: false,
       created_at: this.store.now, updated_at: this.store.now, closed_at: null, merged_at: null, merge_commit_sha: null };
     this.pulls.set(pull.number, pull);

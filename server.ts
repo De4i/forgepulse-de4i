@@ -41,12 +41,11 @@ async function jsonBody(req: IncomingMessage, allowEmpty = false): Promise<unkno
 }
 
 function json(res: ServerResponse, answer: Answer) {
-  const { headers, status, body } = answer;
+  const { headers, status, body, encodedJSON } = answer;
   res.statusCode = status;
   res.setHeader('content-type', jsonType);
   if (headers) for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
-  if (body === undefined) { res.end(); return; }
-  res.end(JSON.stringify(body));
+  res.end(encodedJSON ?? (body === undefined ? undefined : JSON.stringify(body)));
 }
 
 function bytes(res: ServerResponse, value: Buffer, type: string) {
@@ -116,7 +115,6 @@ export function serve(owner: string, token: string, now?: string) {
       req.resume();
       return json(res, { status: 401, body: { message: 'Requires authentication' } });
     }
-    const params = new URLSearchParams(query);
     const origin = 'http://' + (req.headers.host ?? 'localhost');
     if (path === '/api/graphql' && method === 'POST')
       return json(res, { status: 200, body: graphql(await jsonBody(req)) });
@@ -135,7 +133,7 @@ export function serve(owner: string, token: string, now?: string) {
       const input = () => jsonBody(req, true).then(value => {
         try { return record(value); } catch { throw new Fault(400, 'Expected a JSON object'); }
       });
-      return json(res, await rest({ method, origin, path, parts, query: params, json: input }, store));
+      return json(res, await rest({ method, origin, path, parts, query: new URLSearchParams(query), json: input }, store));
     }
     const git = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
     if (!git) return missing();
@@ -143,7 +141,7 @@ export function serve(owner: string, token: string, now?: string) {
     const v2 = versionTwo(req);
     const action = git[3];
     if (action === 'info/refs' && method === 'GET') {
-      const service = params.get('service');
+      const service = new URLSearchParams(query).get('service');
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return missing();
       return bytes(res, advertisement(repo, service, v2), 'application/x-' + service + '-advertisement');
     }
