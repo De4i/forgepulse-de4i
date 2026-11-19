@@ -92,6 +92,8 @@ export class Repository {
   private readonly snapshots = new Map<string, Snapshot>();
   private readonly issueBodies = new WeakMap<Issue, Buffer>();
   private packCacheBytes = 0;
+  private readonly fetchRequests = new Map<string, Buffer>();
+  private fetchRequestBytes = 0;
 
   constructor(store: Store, name: string, description: string, privateRepo: boolean) {
     this.store = store;
@@ -114,6 +116,8 @@ export class Repository {
     else this.refs.set(ref, oid);
     this.packCache.clear();
     this.packCacheBytes = 0;
+    this.fetchRequests.clear();
+    this.fetchRequestBytes = 0;
   }
 
   cachePack(key: string, packed: Buffer): void {
@@ -125,6 +129,18 @@ export class Repository {
     }
     this.packCache.set(key, packed);
     this.packCacheBytes += packed.length;
+  }
+
+  cachedFetch(key: string): Buffer | undefined { return this.fetchRequests.get(key); }
+  cacheFetch(key: string, value: Buffer): void {
+    const limit = 8 * 1024 * 1024;
+    if (key.length > 4096 || value.length > limit) return;
+    if (this.fetchRequestBytes + value.length > limit || this.fetchRequests.size === 6) {
+      this.fetchRequests.clear();
+      this.fetchRequestBytes = 0;
+    }
+    this.fetchRequests.set(key, value);
+    this.fetchRequestBytes += value.length;
   }
 
   addObject(type: GitObject['type'], data: Buffer): string {
@@ -369,7 +385,7 @@ export class Repository {
   pull(number: number): Pull { return this.pulls.get(number) ?? missing(); }
   issueJSON(issue: Issue): Buffer {
     let body = this.issueBodies.get(issue);
-    if (!body) this.issueBodies.set(issue, body = Buffer.from(JSON.stringify(issue)));
+    if (body === undefined) this.issueBodies.set(issue, body = Buffer.from(JSON.stringify(issue)));
     return body;
   }
 
