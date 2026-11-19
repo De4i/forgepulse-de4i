@@ -1,0 +1,3 @@
+# The compiled binary is built by the build step; keep the tree reproducible
+# from source only while developing.
+/forgepulse

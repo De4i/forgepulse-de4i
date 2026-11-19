@@ -138,6 +138,37 @@ func (r *Repository) history(oid string, limit int) []string {
 	return out
 }
 
+// ancestorIncoming answers the same question as ancestor while the pushed
+// objects are still only in the incoming map: a fast-forward must be provable
+// before the objects are published to the store.
+func (r *Repository) ancestorIncoming(want, from string, incoming map[string]*Object) bool {
+	if want == "" || from == "" {
+		return false
+	}
+	seen := map[string]bool{}
+	stack := []string{from}
+	for len(stack) > 0 {
+		oid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if oid == want {
+			return true
+		}
+		if seen[oid] {
+			continue
+		}
+		seen[oid] = true
+		o, ok := r.Object(oid)
+		if !ok {
+			o, ok = incoming[oid]
+		}
+		if !ok || o.Type != TypeCommit {
+			continue
+		}
+		stack = append(stack, parseCommit(oid, o.Data).Parents...)
+	}
+	return false
+}
+
 // ancestor reports whether want appears in the history reachable from from.
 func (r *Repository) ancestor(want, from string) bool {
 	if want == "" || from == "" {

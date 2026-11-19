@@ -1,60 +1,30 @@
-import { once } from 'node:events';
-import { setTimeout as delay } from 'node:timers/promises';
-import { serve } from './server.ts';
+import { spawn } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-async function startTrial() {
-  const setting = process.env.MAKEFUN_ENV_URL;
-  if (!setting) throw new Error('MAKEFUN_ENV_URL is required');
-  const env = new URL(setting);
-  if (env.protocol !== 'http:' && env.protocol !== 'https:') throw new Error('Invalid trial environment URL');
-  // The published trial tenant is independent of the opaque authentication secret.
-  const owner = process.env.FORGE_OWNER ?? 'adaiversen';
-  const server = serve(owner, process.env.MAKEFUN_SHOP_TOKEN ?? '',
-    process.env.MAKEFUN_TRIAL_NOW);
-  server.listen(0, '0.0.0.0');
-  await once(server, 'listening');
-  try {
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('Forge has no TCP listener');
-    const register = new URL('/register', env);
-    const done = new URL('/done', env);
-    let registered = false;
-    for (let attempt = 0; attempt < 12 && !registered; attempt++) {
-      let response: Response | undefined;
-      try {
-        response = await fetch(register, {
-          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port: address.port }),
-          redirect: 'error', signal: AbortSignal.timeout(1200),
-        });
-        await response.arrayBuffer();
-      } catch { /* The suite may still be starting. */ }
-      if (response?.status === 200 || response?.status === 409) registered = true;
-      else if (response && response.status >= 400 && response.status < 500) throw new Error('Trial registration was refused');
-      if (!registered) await delay(Math.min(500, 25 * 2 ** attempt));
-    }
-    if (!registered) throw new Error('Could not register with the trial environment');
-    let interval = 100;
-    for (;;) {
-      await delay(interval);
-      try {
-        const response = await fetch(done, { redirect: 'error', signal: AbortSignal.timeout(1500) });
-        if (response.ok) {
-          const body = await response.json() as { done?: unknown };
-          if (body.done === true) return;
-        } else await response.arrayBuffer();
-      } catch { /* A failed poll does not end a live trial. */ }
-      interval = Math.min(1000, interval * 2);
-    }
-  } finally {
-    await new Promise<void>(resolve => {
-      server.close(() => resolve());
-      server.closeAllConnections();
-    });
+// Trial entry point. The forge itself is the statically linked Go binary
+// sitting beside this file: it binds an ephemeral port, registers it with the
+// trial environment and long-polls for completion. This launcher only starts
+// it, forwards stdio and propagates its exit code, so the trial sees one
+// process tree and the forge's own exit status.
+const here = dirname(fileURLToPath(import.meta.url));
+const binary = join(here, 'forgepulse');
+
+const child = spawn(binary, [], { stdio: 'inherit', env: process.env });
+
+child.on('error', error => {
+  process.stderr.write(`forgepulse: could not start ${binary}: ${error.message}\n`);
+  process.exit(1);
+});
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
   }
-}
+  process.exit(code ?? 0);
+});
 
-try { await startTrial(); }
-catch (error) {
-  process.stderr.write('forgepulse: ' + (error instanceof Error ? error.message : 'Trial startup failed') + '\n');
-  process.exitCode = 1;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => child.kill(signal));
 }
