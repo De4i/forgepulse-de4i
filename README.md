@@ -1,5 +1,11 @@
 # Forgepulse
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/De4i/forgepulse-de4i/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/De4i/forgepulse-de4i/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+Built for make.fun's “Build a GitHub-compatible git forge” bounty.
+
 Forgepulse is a Git forge for one account. Its Node 22 process owns the repository
 store and serves Git smart HTTP, REST v3, GraphQL, and MCP. It requires no installed
 dependencies or Git executable. Repositories and objects live in memory for the
